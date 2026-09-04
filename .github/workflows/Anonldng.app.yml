@@ -1,0 +1,1492 @@
+#!/usr/bin/env python3
+# VulnScan Pro - Pydroid 3 GUI Vulnerability Scanner
+# Authorized testing only: scan assets you own or have permission to assess.
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import threading
+import socket
+import ssl
+import re
+import os
+import html
+import queue
+import datetime
+import concurrent.futures as cf
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+DOWNLOAD = "/storage/emulated/0/Download"
+
+UA = {
+    "User-Agent": "Mozilla/5.0 (VulnScanPro/1.0)"
+}
+
+TOP_PORTS = {
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    80: "HTTP",
+    110: "POP3",
+    135: "RPC",
+    139: "NetBIOS",
+    143: "IMAP",
+    443: "HTTPS",
+    445: "SMB",
+    993: "IMAPS",
+    995: "POP3S",
+    1433: "MSSQL",
+    1521: "Oracle",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    6379: "Redis",
+    8080: "HTTP-alt",
+    8443: "HTTPS-alt",
+    9200: "Elasticsearch",
+    27017: "MongoDB"
+}
+
+SUSPECT_PATHS = [
+    "/.git/HEAD",
+    "/.env",
+    "/phpinfo.php",
+    "/server-status",
+    "/actuator/health",
+    "/backup.zip",
+    "/backup.sql",
+    "/dump.sql",
+    "/.htaccess",
+    "/wp-config.php.bak",
+    "/admin/",
+    "/wp-login.php",
+    "/debug/vars",
+    "/console/",
+    "/swagger-ui.html"
+]
+
+SQL_ERRORS = [
+    r"you have an error in your sql syntax",
+    r"warning: mysql",
+    r"unclosed quotation mark",
+    r"quoted string not properly terminated",
+    r"pg_query\(\)",
+    r"sqlite3?\.query",
+    r"ora-\d{5}",
+    r"odbc.*driver"
+]
+
+SEC_HEADERS = [
+    "Content-Security-Policy",
+    "Strict-Transport-Security",
+    "X-Frame-Options",
+    "X-Content-Type-Options",
+    "Referrer-Policy",
+    "Permissions-Policy"
+]
+
+CVE_HINTS = [
+    (
+        r"OpenSSH[_/ ]([0-9.]+)",
+        "SSH",
+        (8, 4),
+        "Old OpenSSH version detected — review current vendor security advisories."
+    ),
+    (
+        r"Apache/([0-9.]+)",
+        "HTTP",
+        (2, 4, 58),
+        "Old Apache version detected — review current Apache security advisories."
+    ),
+    (
+        r"nginx/([0-9.]+)",
+        "HTTP",
+        (1, 25, 4),
+        "Old nginx version detected — review current nginx security advisories."
+    ),
+    (
+        r"Microsoft-IIS/([0-9.]+)",
+        "HTTP",
+        (10, 0),
+        "Legacy IIS detected — review current Microsoft security advisories."
+    ),
+    (
+        r"Redis",
+        "Redis",
+        None,
+        "Redis exposure should be reviewed; verify authentication and network access controls."
+    )
+]
+
+
+class Scanner:
+
+    def __init__(self, log, finding, stop_event):
+        self.log = log
+        self.finding = finding
+        self.stop = stop_event
+
+    def tcp_scan(self, host, port, timeout=1.5):
+        try:
+            s = socket.socket()
+            s.settimeout(timeout)
+
+            if s.connect_ex((host, port)) == 0:
+
+                banner = ""
+
+                try:
+                    if port not in (22, 21):
+                        s.sendall(
+                            b"HEAD / HTTP/1.0\r\n"
+                            b"Host: target\r\n"
+                            b"Connection: close\r\n\r\n"
+                        )
+                    else:
+                        s.sendall(b"\n")
+
+                    s.settimeout(2)
+                    banner = s.recv(512).decode(
+                        "utf-8",
+                        "replace"
+                    ).strip()
+
+                except Exception:
+                    pass
+
+                s.close()
+
+                return port, banner
+
+        except Exception:
+            pass
+
+        return None
+
+    def scan_ports(self, host, ports):
+
+        self.log(
+            "[*] Port scan: %s (%d ports)"
+            % (host, len(ports))
+        )
+
+        open_ports = []
+
+        with cf.ThreadPoolExecutor(
+            max_workers=min(100, len(ports))
+        ) as ex:
+
+            futs = {
+                ex.submit(self.tcp_scan, host, p): p
+                for p in ports
+            }
+
+            for f in cf.as_completed(futs):
+
+                if self.stop.is_set():
+                    break
+
+                try:
+                    r = f.result()
+                except Exception:
+                    continue
+
+                if r:
+
+                    p, banner = r
+                    open_ports.append(p)
+
+                    svc = TOP_PORTS.get(p, "?")
+
+                    first_line = ""
+
+                    if banner:
+                        first_line = banner.splitlines()[0][:80]
+
+                    self.log(
+                        "[+] OPEN  %-5d %-12s %s"
+                        % (p, svc, first_line)
+                    )
+
+                    if banner:
+
+                        for pat, svc_name, safe_ver, hint in CVE_HINTS:
+
+                            try:
+                                m = re.search(
+                                    pat,
+                                    banner,
+                                    re.I
+                                )
+                            except Exception:
+                                m = None
+
+                            if m:
+
+                                version = (
+                                    m.group(1)
+                                    if m.groups()
+                                    else ""
+                                )
+
+                                if (
+                                    safe_ver is None
+                                    or self.tuple_lt(
+                                        self.vtuple(version),
+                                        safe_ver
+                                    )
+                                ):
+                                    self.finding(
+                                        "HIGH",
+                                        "Outdated/known-risk service: "
+                                        "%s %s"
+                                        % (svc_name, version),
+                                        hint,
+                                        "%s:%d" % (host, p)
+                                    )
+
+                    if (
+                        p == 21
+                        and "FTP" in banner
+                        and not self.stop.is_set()
+                    ):
+                        self.ftp_anon(host)
+
+                    if p in (80, 8080):
+                        self.web_checks(
+                            "http://%s:%d" % (host, p)
+                        )
+
+                    if p in (443, 8443):
+                        self.tls_checks(host, p)
+                        self.web_checks(
+                            "https://%s:%d" % (host, p)
+                        )
+
+        return open_ports
+
+    @staticmethod
+    def vtuple(v):
+        nums = re.findall(r"\d+", v)
+
+        try:
+            return tuple(
+                int(x)
+                for x in nums[:3]
+            )
+        except Exception:
+            return (0,)
+
+    @staticmethod
+    def tuple_lt(a, b):
+
+        aa = tuple(a) + (0,) * (3 - len(a))
+        bb = tuple(b) + (0,) * (3 - len(b))
+
+        return aa[:3] < bb[:3]
+
+    def ftp_anon(self, host):
+
+        try:
+
+            s = socket.create_connection(
+                (host, 21),
+                timeout=5
+            )
+
+            s.recv(256)
+
+            s.sendall(
+                b"USER anonymous\r\n"
+            )
+
+            r1 = s.recv(256)
+
+            if not r1:
+                s.close()
+                return
+
+            s.sendall(
+                b"PASS probe@example.com\r\n"
+            )
+
+            r2 = s.recv(256).decode(
+                "utf-8",
+                "replace"
+            )
+
+            s.close()
+
+            if r2.startswith("230"):
+
+                self.finding(
+                    "HIGH",
+                    "Anonymous FTP login allowed",
+                    "Server accepts anonymous credentials; data exposure risk.",
+                    "%s:21" % host
+                )
+
+                self.log(
+                    "[!] FTP anonymous login accepted"
+                )
+
+        except Exception:
+            pass
+
+    def tls_checks(self, host, port=443):
+
+        try:
+
+            c = ssl.create_default_context()
+
+            with socket.create_connection(
+                (host, port),
+                timeout=6
+            ) as sock:
+
+                with c.wrap_socket(
+                    sock,
+                    server_hostname=host
+                ) as ss:
+
+                    cert = ss.getpeercert()
+
+                    issuer = dict(
+                        x[0]
+                        for x in cert.get(
+                            "issuer",
+                            []
+                        )
+                    ).get(
+                        "organizationName",
+                        "?"
+                    )
+
+                    self.log(
+                        "[*] TLS OK: %s | issuer: %s"
+                        % (
+                            ss.version(),
+                            issuer
+                        )
+                    )
+
+                    if "notAfter" in cert:
+
+                        try:
+
+                            exp = datetime.datetime.strptime(
+                                cert["notAfter"],
+                                "%b %d %H:%M:%S %Y %Z"
+                            )
+
+                            days = (
+                                exp
+                                - datetime.datetime.utcnow()
+                            ).days
+
+                            if days < 15:
+
+                                self.finding(
+                                    "MEDIUM"
+                                    if days > 0
+                                    else "HIGH",
+                                    "TLS certificate %s (%d days)"
+                                    % (
+                                        "expiring"
+                                        if days > 0
+                                        else "EXPIRED",
+                                        days
+                                    ),
+                                    "Cert notAfter: %s" % exp,
+                                    "%s:%d" % (
+                                        host,
+                                        port
+                                    )
+                                )
+
+                        except Exception:
+                            pass
+
+            try:
+
+                weak = ssl.SSLContext(
+                    ssl.PROTOCOL_TLS
+                )
+
+                weak.maximum_version = (
+                    ssl.TLSVersion.TLSv1_1
+                )
+
+                with socket.create_connection(
+                    (host, port),
+                    timeout=5
+                ) as sock:
+
+                    weak.wrap_socket(
+                        sock,
+                        server_hostname=host
+                    )
+
+                self.finding(
+                    "MEDIUM",
+                    "Deprecated TLS versions accepted",
+                    "Server may negotiate TLS 1.0/1.1.",
+                    "%s:%d" % (host, port)
+                )
+
+            except Exception:
+                pass
+
+        except ssl.SSLCertVerificationError:
+
+            self.finding(
+                "MEDIUM",
+                "Invalid/self-signed TLS certificate",
+                "Certificate chain fails verification.",
+                "%s:%d" % (host, port)
+            )
+
+        except Exception as e:
+
+            self.log(
+                "[-] TLS check failed: %s"
+                % e
+            )
+
+    def web_checks(self, base):
+
+        if requests is None:
+            self.log(
+                "[-] requests is not installed."
+            )
+            return
+
+        if self.stop.is_set():
+            return
+
+        self.log(
+            "[*] Web checks: %s"
+            % base
+        )
+
+        try:
+
+            r = requests.get(
+                base,
+                headers=UA,
+                timeout=8,
+                verify=False,
+                allow_redirects=True
+            )
+
+        except Exception as e:
+
+            self.log(
+                "[-] HTTP fail: %s"
+                % e
+            )
+
+            return
+
+        h = r.headers
+        body = r.text[:6000]
+
+        missing = [
+            x
+            for x in SEC_HEADERS
+            if x not in h
+        ]
+
+        if missing:
+
+            self.finding(
+                "LOW",
+                "Missing security headers (%d)"
+                % len(missing),
+                ", ".join(missing),
+                base
+            )
+
+        csp = h.get(
+            "Content-Security-Policy",
+            ""
+        )
+
+        if (
+            "unsafe-inline" in csp
+            or "unsafe-eval" in csp
+        ):
+
+            self.finding(
+                "MEDIUM",
+                "Weak CSP (unsafe-inline/eval)",
+                csp[:120],
+                base
+            )
+
+        cookie_header = h.get(
+            "Set-Cookie",
+            ""
+        )
+
+        for ck in cookie_header.split("\n"):
+
+            if (
+                ck
+                and "httponly" not in ck.lower()
+            ):
+
+                self.finding(
+                    "MEDIUM",
+                    "Cookie without HttpOnly",
+                    ck[:120],
+                    base
+                )
+
+        if re.search(
+            r"<title>\s*Index of /",
+            body,
+            re.I
+        ):
+
+            self.finding(
+                "HIGH",
+                "Directory listing enabled",
+                "Autoindex exposes file tree.",
+                base
+            )
+
+        server = h.get(
+            "Server"
+        )
+
+        if server:
+
+            self.log(
+                "[*] Server: %s"
+                % server
+            )
+
+        self.path_fuzz(base)
+
+        if self.active_enabled():
+            self.active_checks(base)
+
+    def active_enabled(self):
+        return getattr(
+            self,
+            "_active_enabled",
+            False
+        )
+
+    def set_active(self, enabled):
+        self._active_enabled = enabled
+
+    def path_fuzz(self, base):
+
+        if requests is None:
+            return
+
+        for path in SUSPECT_PATHS:
+
+            if self.stop.is_set():
+                return
+
+            try:
+
+                r = requests.get(
+                    base + path,
+                    headers=UA,
+                    timeout=6,
+                    verify=False
+                )
+
+                if r.status_code == 200 and len(r.text) > 0:
+
+                    sig = ""
+
+                    if (
+                        path == "/.git/HEAD"
+                        and "ref:" in r.text[:64]
+                    ):
+                        sig = "exposed git repository"
+
+                    elif (
+                        path == "/.env"
+                        and re.search(
+                            r"[A-Z_]+=",
+                            r.text
+                        )
+                    ):
+                        sig = "environment/secrets file"
+n
+                    elif (
+                        "phpinfo" in path
+                        and "PHP Version" in r.text
+                    ):
+                        sig = "phpinfo() exposure"
+
+                    elif (
+                        path == "/server-status"
+                        and "Apache Status" in r.text
+                    ):
+                        sig = "Apache server-status exposed"
+
+                    elif (
+                        path == "/actuator/health"
+                        and '"status"' in r.text
+                    ):
+                        sig = "Spring Boot actuator"
+
+                    elif (
+                        "swagger" in path
+                        and "swagger" in r.text.lower()
+                    ):
+                        sig = "API documentation exposed"
+
+                    if sig:
+
+                        self.finding(
+                            "HIGH",
+                            "Sensitive path exposed: %s"
+                            % path,
+                            sig,
+                            base + path
+                        )
+
+                    elif path in (
+                        "/backup.zip",
+                        "/backup.sql",
+                        "/dump.sql",
+                        "/.htaccess",
+                        "/wp-config.php.bak"
+                    ):
+
+                        self.finding(
+                            "MEDIUM",
+                            "Possible backup/sensitive file: "
+                            "%s (verify)" % path,
+                            "HTTP 200, %d bytes"
+                            % len(r.text),
+                            base + path
+                        )
+
+            except Exception:
+                pass
+
+    def active_checks(self, base):
+
+        if requests is None:
+            return
+
+        if self.stop.is_set():
+            return
+
+        # Safe reflected-input check
+        try:
+
+            marker = "VULNSCAN_REFLECTION_TEST_123"
+
+            url = base
+
+            separator = (
+                "&"
+                if "?" in url
+                else "?"
+            )
+
+            test_url = (
+                url
+                + separator
+                + "q="
+                + marker
+            )
+
+            r = requests.get(
+                test_url,
+                headers=UA,
+                timeout=6,
+                verify=False
+            )
+
+            if marker in r.text:
+
+                self.finding(
+                    "MEDIUM",
+                    "Reflected input detected",
+                    "A harmless marker was reflected in the response; review output encoding.",
+                    test_url
+                )
+
+        except Exception:
+            pass
+
+        # SQL error signature check
+        try:
+
+            r = requests.get(
+                base + "?q=test%27",
+                headers=UA,
+                timeout=6,
+                verify=False
+            )
+
+            for sig in SQL_ERRORS:
+
+                if re.search(
+                    sig,
+                    r.text,
+                    re.I
+                ):
+
+                    self.finding(
+                        "HIGH",
+                        "Possible SQL error exposure",
+                        "Database error signature detected: %s"
+                        % sig,
+                        base
+                    )
+
+                    break
+
+        except Exception:
+            pass
+
+        # Open redirect check
+        try:
+
+            for pname in (
+                "next",
+                "redirect",
+                "url",
+                "return",
+                "goto"
+            ):
+
+                if self.stop.is_set():
+                    return
+
+                r = requests.get(
+                    "%s/?%s=https://example.invalid/"
+                    % (base, pname),
+                    headers=UA,
+                    timeout=6,
+                    verify=False,
+                    allow_redirects=False
+                )
+
+                loc = r.headers.get(
+                    "Location",
+                    ""
+                )
+
+                if (
+                    r.status_code in (301, 302)
+                    and "example.invalid" in loc
+                ):
+
+                    self.finding(
+                        "MEDIUM",
+                        "Possible open redirect via '%s'"
+                        % pname,
+                        "Redirects to: %s" % loc,
+                        base
+                    )
+
+        except Exception:
+            pass
+
+
+class App:
+
+    def __init__(self, root):
+
+        self.root = root
+        self.q = queue.Queue()
+        self.findings = []
+        self.stop = threading.Event()
+
+        root.title(
+            "VulnScan Pro - Pydroid 3"
+        )
+
+        root.geometry(
+            "720x900"
+        )
+
+        top = ttk.Frame(
+            root,
+            padding=6
+        )
+
+        top.pack(
+            fill="x"
+        )
+
+        ttk.Label(
+            top,
+            text="Target (host / URL / CIDR):"
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w"
+        )
+
+        self.target = ttk.Entry(
+            top
+        )
+
+        self.target.grid(
+            row=1,
+            column=0,
+            sticky="we",
+            pady=3
+        )
+
+        self.target.insert(
+            0,
+            "scanme.nmap.org"
+        )
+
+        # TARGET BUTTON ADDED
+        self.target_btn = ttk.Button(
+            top,
+            text="TARGET",
+            command=self.focus_target
+        )
+
+        self.target_btn.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=2
+        )
+
+        self.opts = {
+            k: tk.BooleanVar(value=v)
+            for k, v in [
+                ("ports", True),
+                ("tls", True),
+                ("web", True),
+                ("active", False)
+            ]
+        }
+
+        labels = {
+            "ports": "Port scan",
+            "tls": "TLS audit",
+            "web": "Web audit",
+            "active": "Active checks"
+        }
+
+        for i, (k, v) in enumerate(
+            self.opts.items()
+        ):
+
+            ttk.Checkbutton(
+                top,
+                text=labels[k],
+                variable=v
+            ).grid(
+                row=2,
+                column=i,
+                sticky="w"
+            )
+
+        btns = ttk.Frame(
+            top
+        )
+
+        btns.grid(
+            row=1,
+            column=1,
+            sticky="e"
+        )
+
+        self.b_start = ttk.Button(
+            btns,
+            text="SCAN",
+            command=self.start
+        )
+
+        self.b_start.pack(
+            side="left",
+            padx=2
+        )
+
+        ttk.Button(
+            btns,
+            text="STOP",
+            command=self.stop_scan
+        ).pack(
+            side="left",
+            padx=2
+        )
+
+        ttk.Button(
+            btns,
+            text="REPORT",
+            command=self.report
+        ).pack(
+            side="left",
+            padx=2
+        )
+
+        top.columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.prog = ttk.Progressbar(
+            root,
+            mode="indeterminate"
+        )
+
+        self.prog.pack(
+            fill="x"
+        )
+
+        nb = ttk.Notebook(
+            root
+        )
+
+        nb.pack(
+            fill="both",
+            expand=True
+        )
+
+        self.logbox = scrolledtext.ScrolledText(
+            nb,
+            bg="#111",
+            fg="#0f0",
+            font=("monospace", 10)
+        )
+
+        self.find_tb = ttk.Treeview(
+            nb,
+            columns=(
+                "sev",
+                "title",
+                "target"
+            ),
+            show="headings"
+        )
+
+        for c, w in (
+            ("sev", 90),
+            ("title", 380),
+            ("target", 220)
+        ):
+
+            self.find_tb.column(
+                c,
+                width=w
+            )
+
+            self.find_tb.heading(
+                c,
+                text=c.title()
+            )
+
+        for sev, col in (
+            ("CRITICAL", "#b00"),
+            ("HIGH", "#e60"),
+            ("MEDIUM", "#cc0"),
+            ("LOW", "#088")
+        ):
+
+            self.find_tb.tag_configure(
+                sev,
+                foreground=col
+            )
+
+        self.summary = scrolledtext.ScrolledText(
+            nb,
+            font=("monospace", 10)
+        )
+
+        nb.add(
+            self.logbox,
+            text="Scan Log"
+        )
+
+        nb.add(
+            self.find_tb,
+            text="Findings"
+        )
+
+        nb.add(
+            self.summary,
+            text="Summary"
+        )
+
+        self.root.after(
+            100,
+            self.pump
+        )
+
+    # TARGET BUTTON ACTION
+    def focus_target(self):
+
+        self.target.focus_set()
+
+        self.target.selection_range(
+            0,
+            tk.END
+        )
+
+    def plog(self, msg):
+        self.q.put(
+            ("log", msg)
+        )
+
+    def add_finding(
+        self,
+        sev,
+        title,
+        detail,
+        target
+    ):
+
+        self.q.put(
+            (
+                "find",
+                (
+                    sev,
+                    title,
+                    detail,
+                    target
+                )
+            )
+        )
+
+    def pump(self):
+
+        try:
+
+            while True:
+
+                kind, val = (
+                    self.q.get_nowait()
+                )
+
+                if kind == "log":
+
+                    self.logbox.insert(
+                        "end",
+                        val + "\n"
+                    )
+
+                    self.logbox.see(
+                        "end"
+                    )
+
+                else:
+
+                    sev, title, detail, target = val
+
+                    self.findings.append(
+                        val
+                    )
+
+                    self.find_tb.insert(
+                        "",
+                        "end",
+                        values=(
+                            sev,
+                            title,
+                            target
+                        ),
+                        tags=(sev,)
+                    )
+
+        except queue.Empty:
+            pass
+
+        self.root.after(
+            100,
+            self.pump
+        )
+
+    def start(self):
+
+        target = (
+            self.target.get()
+            .strip()
+        )
+
+        if not target:
+
+            messagebox.showerror(
+                "Input",
+                "Enter a target."
+            )
+
+            return
+
+        # Clear previous findings
+        self.findings.clear()
+
+        for item in self.find_tb.get_children():
+            self.find_tb.delete(item)
+
+        self.summary.delete(
+            "1.0",
+            "end"
+        )
+
+        self.stop.clear()
+
+        self.b_start.config(
+            state="disabled"
+        )
+
+        self.prog.start(
+            12
+        )
+
+        threading.Thread(
+            target=self.run,
+            daemon=True
+        ).start()
+
+    def stop_scan(self):
+
+        self.stop.set()
+
+        self.b_start.config(
+            state="normal"
+        )
+
+        self.prog.stop()
+
+        self.plog(
+            "[*] Stop requested."
+        )
+
+    def run(self):
+
+        try:
+
+            t = (
+                self.target.get()
+                .strip()
+            )
+
+            t = re.sub(
+                r"^https?://",
+                "",
+                t,
+                flags=re.I
+            )
+
+            t = t.split("/")[0]
+
+            sc = Scanner(
+                self.plog,
+                self.add_finding,
+                self.stop
+            )
+
+            sc.set_active(
+                self.opts["active"].get()
+            )
+
+            self.plog(
+                "[*] Resolving %s ..."
+                % t
+            )
+
+            try:
+
+                host = socket.gethostbyname(
+                    t
+                )
+
+            except Exception:
+
+                self.plog(
+                    "[!] DNS resolution failed."
+                )
+
+                return
+
+            self.plog(
+                "[+] %s -> %s"
+                % (t, host)
+            )
+
+            open_ports = []
+
+            if self.opts["ports"].get():
+
+                open_ports = sc.scan_ports(
+                    host,
+                    sorted(TOP_PORTS)
+                )
+
+            if self.stop.is_set():
+                return
+
+            web_found = any(
+                p in (80, 443, 8080, 8443)
+                for p in open_ports
+            )
+
+            if (
+                self.opts["web"].get()
+                and not web_found
+            ):
+
+                self.plog(
+                    "[*] No web port detected; "
+                    "trying HTTP/HTTPS checks."
+                )
+
+                sc.web_checks(
+                    "http://" + t
+                )
+
+                if not self.stop.is_set():
+
+                    sc.web_checks(
+                        "https://" + t
+                    )
+
+            if (
+                self.opts["tls"].get()
+                and not self.stop.is_set()
+            ):
+
+                sc.tls_checks(
+                    t
+                )
+
+            if not self.stop.is_set():
+
+                self.plog(
+                    "[*] Scan complete. %d findings."
+                    % len(self.findings)
+                )
+
+                self.summarize()
+
+        except Exception as e:
+
+            self.plog(
+                "[!] ERROR: %s"
+                % e
+            )
+
+        finally:
+
+            self.root.after(
+                0,
+                self.scan_finished
+            )
+
+    def scan_finished(self):
+
+        self.b_start.config(
+            state="normal"
+        )
+
+        self.prog.stop()
+
+    def summarize(self):
+
+        from collections import Counter
+
+        c = Counter(
+            f[0]
+            for f in self.findings
+        )
+
+        self.summary.delete(
+            "1.0",
+            "end"
+        )
+
+        self.summary.insert(
+            "end",
+            "SCAN SUMMARY  %s\n%s\n"
+            % (
+                datetime.datetime.now().strftime(
+                    "%Y-%m-%d %H:%M"
+                ),
+                "=" * 50
+            )
+        )
+
+        for sev in (
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+        ):
+
+            self.summary.insert(
+                "end",
+                "  %-8s %d\n"
+                % (
+                    sev,
+                    c.get(sev, 0)
+                )
+            )
+
+        self.summary.insert(
+            "end",
+            "=" * 50
+            + "\n\n"
+        )
+
+        for (
+            sev,
+            title,
+            detail,
+            target
+        ) in self.findings:
+
+            self.summary.insert(
+                "end",
+                "[%s] %s\n"
+                "   %s\n"
+                "   Target: %s\n\n"
+                % (
+                    sev,
+                    title,
+                    detail,
+                    target
+                )
+            )
+
+    def report(self):
+
+        if not self.findings:
+
+            messagebox.showinfo(
+                "Report",
+                "No findings yet."
+            )
+
+            return
+
+        sev_col = {
+            "CRITICAL": "#c00",
+            "HIGH": "#e60",
+            "MEDIUM": "#cc0",
+            "LOW": "#077"
+        }
+
+        rows = ""
+
+        for (
+            s,
+            t,
+            d,
+            g
+        ) in self.findings:
+
+            rows += (
+                "<tr>"
+                "<td style='color:%s'>"
+                "<b>%s</b>"
+                "</td>"
+                "<td>%s<br>"
+                "<small>%s</small>"
+                "</td>"
+                "<td>%s</td>"
+                "</tr>"
+                %
+                (
+                    sev_col.get(
+                        s,
+                        "#000"
+                    ),
+                    html.escape(s),
+                    html.escape(t),
+                    html.escape(d),
+                    html.escape(g)
+                )
+            )
+
+        doc = (
+            "<html>"
+            "<head>"
+            "<meta charset='utf-8'>"
+            "<title>VulnScan Pro Report</title>"
+            "<style>"
+            "body{font-family:monospace}"
+            "table{border-collapse:collapse;width:100%}"
+            "td{border:1px solid #ccc;padding:6px}"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<h1>Vulnerability Assessment Report</h1>"
+            "<p>"
+            "Generated: %s<br>"
+            "Target: %s | "
+            "Total findings: %d"
+            "</p>"
+            "<table>%s</table>"
+            "</body>"
+            "</html>"
+        ) % (
+            datetime.datetime.now().isoformat(),
+            html.escape(
+                self.target.get()
+            ),
+            len(self.findings),
+            rows
+        )
+
+        try:
+
+            os.makedirs(
+                DOWNLOAD,
+                exist_ok=True
+            )
+
+            out = os.path.join(
+                DOWNLOAD,
+                "vulnscan_report_%s.html"
+                % datetime.datetime.now().strftime(
+                    "%Y%m%d_%H%M%S"
+                )
+            )
+
+            with open(
+                out,
+                "w",
+                encoding="utf-8"
+            ) as f:
+
+                f.write(doc)
+
+            messagebox.showinfo(
+                "Report saved",
+                out
+            )
+
+        except Exception as e:
+
+            messagebox.showerror(
+                "Report Error",
+                str(e)
+            )
+
+
+if __name__ == "__main__":
+
+    root = tk.Tk()
+
+    App(root)
+
+    root.mainloop()
